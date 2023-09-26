@@ -1,0 +1,448 @@
+---
+title: "EDA"
+author: "Che Diaz Fadel"
+date: "2023-09-26"
+output: 
+  html_document:
+    number_sections: yes
+    toc: yes
+    df_print: paged
+    theme: darkly
+    highlight: tango
+    fig_width: 15
+    fig_height: 10
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+
+options(tibble.print_max = 40,
+        tibble.print_min = 24,
+        width = 110,
+        pillar.min_title_chars = 15,
+        scipen = 999)
+```
+
+# Introduction
+## Business problem 
+
+Maverik is interested in producing more accurate financial plans and initial ROI documents for future convenience store locations. Considerable uncertainty is associated with deploying new locations in their network and being able to properly allocate resources and accurately predict profitability is crucial to the prosperity of their business. To this end, this project aims to augment veracity of financial plans and ROI documents by leveraging the store-level time series and qualitative data collected by Maverik. This will be done by employing an ensemble of forecasting and supervised regression models designed to provide daily store level sales forecasts of multiple key product categories. Success of this project will be benchmarked against Maverik's existing Naive forecasting solution and the proposed model will be tuned to minimize:\
+
+-   Akaike Information Criterion (AIC)\
+-   Root Mean Squared Error (RMSE)\
+-   Mean Absolute Percentage Error (MAPE)\
+
+Key abilities of the final must include:\
+
+-   Calculation of daily level, seasonally sensitive forecast for each of the sales metrics defined by Maverik.\
+-   Functionality to create updated forecasts given new data.\
+
+The ability to accurately forecast store sales will enable Maverik to optimize the expenditure of scarce resources by pursuing the most profitable locations and minimizing misallocation of said resources when opening a new store. This will lead to better investment, decreased waste, and more reliable financial evaluations.
+
+## EDA Objectives
+
+As well as gaining a greater holistic understanding of the provided data, this EDA aims to answer the following questions:\
+
+-   What preprocessing/cleaning is required?\
+    -   What is the scale of missing values? How should they be handled?\
+    -   Do erroneously encoded categorical variables need to be corrected?\
+    -   How do date attributes need to be standardized or formatted to ensure accurate seasonality calculations?\
+    -   Is the existing data "tidy"?\
+        -   Each variable has its own column\
+        -   Each observation has its own row\
+        -   Each value has its own cell\
+-   Which features are most correlated with each of the target sales metrics?\
+-   What explanatory variables are collinear and how should that be handled?\
+-   What affect does seasonality have on the target variables?\
+
+
+
+# Loading packages and data 
+
+```{r}
+# Load packages 
+library(lemon)
+library(skimr)
+library(lubridate)
+library(magrittr)
+library(zoo)
+library(tidyverse)
+library(readxl)
+library(scales)
+library(GGally)
+library(caret)
+library(ggTimeSeries)
+library(fpp3)
+library(patchwork)
+
+# Load data 
+mvts <- read_csv("../data/time_series_data_msba.csv") %>%
+  # removing unnamed row index column
+  select(-1) %>% 
+  # simplifying column names
+  rename_with(~str_split_1(paste0("open_date,date,week_id,day_name,holiday,",
+                                  "day_type,inside_sales,food_service,diesel,",
+                                  "unleaded,site_id"), ",")) %>% 
+  # set site_id as first column
+  relocate(site_id) %>%
+  arrange(site_id, date)
+
+mvq <- read_csv("../data/qualitative_data_msba.csv") %>%
+  # removing unnamed row index column
+  # `RV Lanes Fueling Positions` and `Hi-Flow Lanes Fueling Positions` are duplicated columns
+  select(-c(1, `RV Lanes Fueling Positions`, `Hi-Flow Lanes Fueling Positions`)) %>%
+  # set site_id as first column
+  select(site_id = site_id_msba, colnames(.)) %>% 
+  # simplify column names
+  rename_with(\(x){
+    # replace spaces with underscores
+    gsub(" +", "_", tolower(x)) %>%
+      # remove single quotes and apostrophes
+      gsub("'|’", "", .) %>%
+      # validate variables beginning with numbers
+      gsub("^(\\d)", "x\\1", .)
+  }) %>%
+  # distinguish from variable found in time series data
+  rename(has_diesel = diesel)
+
+```
+
+# Initial inspection
+
+## Time series data
+
+```{r}
+# First look
+mvts %>%
+  head(5)
+
+# Glimpse
+mvts %>% 
+  glimpse()
+
+# Summary
+mvts %>%
+  # change character variables and site_id to factor
+  mutate(across(c(where(is.character), site_id), factor)) %>%
+  summary()
+
+# Total store count
+n_distinct(mvts$site_id)
+
+# Date range of stores
+mvts %>% 
+  # n() == # of days store exists in data
+  count(site_id) %>%
+  select(n) %>%
+  # generate summary statistics
+  summary()
+
+```
+
+The time series data contains the daily, store level sales of the four target variables: `inside_sales`, `food_service`, `diesel`, and `unleaded`. Other data pertaining to dates are provided herein, including:\
+
+-   `week_id`: Fiscal week number\
+-   `day_name`: Day of the week name\
+-   `open_date`: Date the store opened\
+-   `holiday`: What holiday (if any) occured on that day\
+-   `day_type`: Either "WEEKDAY" or "WEEKEND"\
+
+None of the variables have any missing values that will have to be dealt with.
+
+## Qualitative data
+
+```{r}
+# First look
+mvq %>%
+  head(5)
+
+# Data frame dimensions
+dim(mvq)
+
+# Summary 
+mvq %>%
+  # convert character variables and site_id to factor
+  mutate(across(c(where(is.character), site_id), factor)) %>%
+  summary()
+```
+
+The qualitative data set offers a mix of 52 categorical and numerical variables describing site attributes and demographic/socioeconomic statistics of the surrounding area. Interestingly, site #23065 is missing from this data set and will have to be removed from the time series data set.
+
+```{r}
+symdiff(mvts$site_id, mvq$site_id)
+```
+
+`mvq` does not have any explicitly `NA` values, but does utilize a character string to indicate such. 
+
+```{r}
+mvq %>%
+  # select columns containing "N/A"
+  select(where(~any(grepl("^N/?A$", .)))) %>%
+  # for each column, calculate proportion of observations containing "N/A"
+  summarise(
+    across(
+      everything(), 
+      ~sum(grepl("^N/?A$", .)) / n()
+    )
+  ) %>%
+  # Covert to long-form
+  pivot_longer(everything(),
+               names_to = "col",
+               values_to = "prop_na")
+```
+
+This can be solved with the following:
+
+```{r}
+mvq1 <- mvq %>%
+  mutate(
+    across(
+      where(~any(grepl("^N/?A$", .))),
+      ~replace(., grepl("^N/?A$", .), NA)
+    )
+  )
+
+# Confirm same proportions as before
+mvq1 %>% 
+  # select columns containing missing values
+  select(where(~any(is.na(.)))) %>%
+  # for each column, calculate proportion of missing values
+  summarise(
+    across(
+      everything(),
+    ~sum(is.na(.)) / n()
+    )
+  ) %>%
+  #convert to long-form
+  pivot_longer(everything(),
+               names_to = "col",
+               values_to = "prop_na")
+```
+
+`mvq` also contains some zero-variance variables which would not contribute to any model and should be taken out.
+
+```{r}
+mvq1 %>%
+  summarise(
+    across(
+      everything(),
+      list(
+        # for each column, calculate number of distinct values
+        ndistinct = ~n_distinct(., na.rm = TRUE),
+        # for each column, calculate variance
+        var = ~var(., na.rm = TRUE) %>% round(4),
+        # for each column, concatenate up to three unique values
+        samp = ~paste0(na.omit(unique(.)[1:3]), collapse = ", ")
+      )
+    )
+  ) %>%
+  #convert to long form
+  pivot_longer(everything(),
+               names_to = c("col", ".value"),
+               names_pattern = "(.*)_(.*)") %>%
+  arrange(ndistinct)
+```
+
+
+## Dates
+
+The entire data set spans from 2021-01-12 to 2023-08-16 and all 38 stores are present for one year and one day. Is the extra day of any analytical significance or simply an artifact of the fiscal calendar? Given that every store exists for the same length of time, it will be helpful to know the distribution of stores across dates.
+
+```{r}
+# mvts %>%
+#   group_by(date) %>%
+#   # count of stores for each date
+#   summarise(n = n()) %>%
+#   ggplot() +
+#   geom_col(aes(date, n),
+#            fill = "darkred", color = "darkred") +
+#   # Fix date axis labels
+#   scale_x_date(breaks = seq(as_date("2021-01-01"), as_date("2023-09-01"), "3 months"),
+#                labels = ~ifelse(month(.) == 1, format(., "%Y"), format(., "%b"))) +
+#   scale_y_continuous(breaks = seq(0, 30, 5)) +
+#   theme_minimal(20) +
+#   labs(title = "Count of stores for each date")
+
+# Bar plot
+{
+  mvts %>%
+  # count of stores for each date
+  count(date) %>%
+  ggplot() +
+  geom_col(aes(date, n),
+           fill = "darkred", alpha = 0.7, width = 1) +
+  # Fix date axis labels
+  scale_x_date(breaks = seq(as_date("2021-01-01"), as_date("2023-09-01"), "3 months"),
+               labels = ~ifelse(month(.) == 1, format(., "%Y"), format(., "%b"))) +
+  scale_y_continuous(breaks = seq(0, 30, 5)) +
+  theme_minimal(20) +
+  labs(title = "Count of stores vs date")
+} /
+  # Line plot
+  {
+    mvts %>%
+      arrange(open_date, site_id, date) %>% 
+      # rescale site_id for plot
+      mutate(site_id = consecutive_id(site_id)) %>%
+      ggplot() +
+      geom_line(aes(date, site_id, group = site_id),
+                color = "steelblue", linewidth = 2, show.legend = FALSE) +
+      # Fix date axis labels
+      scale_x_date(breaks = seq(as_date("2021-01-01"), as_date("2023-09-01"), "3 months"),
+                   labels = ~ifelse(month(.) == 1, format(., "%Y"), format(., "%b"))) +
+      scale_y_continuous(breaks = seq(0, 38, 4),
+                         minor_breaks = NULL) +
+      theme_minimal(20) +
+      labs(title = "Store-wise date range",
+           y = "Cumulative store count")
+  }`
+
+```
+
+Given that `open_date` is not uniformly distributed, network-wide seasonality will have to be calculated either on a sales per store basis or by standardizing the date by attributing a day ID similar to `week_id`. Maverik expressed the importance of aligning days in a standardized manner, which is why `week_id` is included. I'll begin dissecting the fiscal calendar structure by determining if a singular day of the week begins each week.
+
+```{r}
+mvts %>%
+  distinct(date, .keep_all = TRUE) %>%
+  # since week_id resets each year, values are not unique to distinct weeks
+  group_by(unique_week_id = consecutive_id(week_id)) %>%
+  # remove incomplete weeks
+  mutate(unique_week_len = n()) %>%
+  filter(unique_week_len == 7) %>%
+  # subset first day of fiscal week
+  summarise_all(first) %>%
+  # determine variety 
+  count(day_name)
+```
+
+Now that we know each (complete) week begins on Friday, we can begin constructing a standardized day_id.
+
+```{r}
+# Begin with completed date range found in data
+day_id_df <- tibble(date = seq(as_date("2021-01-01"), as_date("2023-12-31"), "1 day")) %>%
+  # Calculate week_id
+  mutate(week_id = yearweek(date, week_start = 5) %>% format("%V") %>% as.numeric(),
+         # since the first day of fiscal year 2022 is actually in 2021, special logic must be 
+         # applied to identify the beginning of the year
+         x = case_when(lag(week_id, default = 52) == 52 & week_id == 1 ~ 1),
+         year = 2020 + rollapplyr(x, width = n(), FUN = sum, na.rm = TRUE, partial = TRUE)) %>%
+  group_by(year) %>%
+  mutate(day_id = row_number()) %>%
+  select(-x) %>%
+  ungroup()
+
+day_id_df
+
+# Validating accuracy by comparing to mvts' week_id
+day_id_df %>%
+  # trimming to mvts' date range
+  filter(date >= "2021-01-12",
+         date <= "2023-08-16") %>%
+  # counting instances of manually calculated week_id and renaming columns
+  count(custom_week_id = week_id,
+        name = "custom_n") %>%
+  bind_cols(mvts %>%
+  distinct(date, week_id) %>%
+  # counting instances of native week_id and renaming columns
+  count(mvts_week_id = week_id,
+        name = "mvts_n")) %>%
+  # subsetting discrepant rows
+  filter(custom_n != mvts_n)
+
+
+```
+
+
+
+# Target variables
+
+```{r}
+# Histogram (density)
+mvts %>%
+  pivot_longer(c(inside_sales, food_service, diesel, unleaded),
+               names_to = "metric",
+               values_to = "sales") %>%
+  group_by(metric, site_id) %>%
+  summarise(sales = sum(sales)) %>%
+  mutate(sales = scale(sales)[,1]) %>%
+  ggplot() +
+  geom_density(aes(sales, color = metric)) +
+  theme_minimal(20) +
+  labs(title = "Distribution of key sales metrics (scaled and centered)")
+
+# Violin
+mvts %>%
+  pivot_longer(c(inside_sales, food_service, diesel, unleaded),
+               names_to = "metric",
+               values_to = "sales") %>%
+  group_by(metric, site_id) %>%
+  summarise(sales = sum(sales)) %>%
+  mutate(sales = scale(sales)[,1]) %>%
+  ggplot() +
+  geom_violin(aes(metric, sales, fill = metric),
+              color = "white", draw_quantiles = c(0.25, 0.5, 0.75)) +
+  theme_minimal(20) +
+  labs(title = "Distribution of key sales metrics (scaled and centered)")
+
+# Line
+mvts %>%
+  left_join(day_id_df %>%
+              select(date, day_id), "date") %>%
+  pivot_longer(c(inside_sales, food_service, diesel, unleaded),
+               names_to = "metric",
+               values_to = "sales") %>%
+  group_by(metric, day_id) %>%
+  summarise(sales = sum(sales)) %>%
+  mutate(sales = scale(sales)[,1]) %>%
+  ggplot() +
+  geom_line(aes(day_id, sales)) +
+  facet_rep_wrap(~metric, repeat.tick.labels = TRUE, ncol = 1)
+
+# Correlation
+mvts %>%
+  left_join(day_id_df %>%
+              select(date, day_id), "date") %>%
+  select(inside_sales, food_service, diesel, unleaded, day_id) %>%
+  ggpairs(aes(color = cut(day_id, 91, keeplow)))
+  
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
