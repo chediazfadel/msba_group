@@ -11,14 +11,23 @@ output:
     highlight: tango
     fig_width: 15
     fig_height: 10
+editor_options: 
+  chunk_output_type: console
 ---
+<style type="text/css">
+.main-container {
+  max-width: 1100px;
+  margin-left: auto;
+  margin-right: auto;
+}
+</style>
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(warning = FALSE, message = FALSE)
 
 options(tibble.print_max = 40,
         tibble.print_min = 24,
-        width = 110,
+        width = 150,
         pillar.min_title_chars = 15,
         scipen = 999)
 ```
@@ -70,10 +79,14 @@ library(tidyverse)
 library(readxl)
 library(scales)
 library(GGally)
+library(ggrepel)
+library(ggforce)
 library(caret)
 library(ggTimeSeries)
+library(ggpointdensity)
 library(fpp3)
 library(patchwork)
+library(plotly)
 
 # Load data 
 mvts <- read_csv("../data/time_series_data_msba.csv") %>%
@@ -95,8 +108,8 @@ mvq <- read_csv("../data/qualitative_data_msba.csv") %>%
   select(site_id = site_id_msba, colnames(.)) %>% 
   # simplify column names
   rename_with(\(x){
-    # replace spaces with underscores
-    gsub(" +", "_", tolower(x)) %>%
+    # replace spaces, slashes, and hyphens with underscores
+    gsub(" +|-|/", "_", tolower(x)) %>%
       # remove single quotes and apostrophes
       gsub("'|’", "", .) %>%
       # validate variables beginning with numbers
@@ -116,28 +129,15 @@ mvq <- read_csv("../data/qualitative_data_msba.csv") %>%
 mvts %>%
   head(5)
 
-# Glimpse
-mvts %>% 
-  glimpse()
-
-# Summary
-mvts %>%
-  # change character variables and site_id to factor
-  mutate(across(c(where(is.character), site_id), factor)) %>%
-  summary()
-
-# Total store count
-n_distinct(mvts$site_id)
-
-# Date range of stores
-mvts %>% 
-  # n() == # of days store exists in data
-  count(site_id) %>%
-  select(n) %>%
-  # generate summary statistics
-  summary()
-
 ```
+
+```{r render = knitr::normal_print}
+# Skim
+mvts %>%
+  mutate(site_id = as.character(site_id)) %>%
+  skim() 
+```
+
 
 The time series data contains the daily, store level sales of the four target variables: `inside_sales`, `food_service`, `diesel`, and `unleaded`. Other data pertaining to dates are provided herein, including:\
 
@@ -156,14 +156,13 @@ None of the variables have any missing values that will have to be dealt with.
 mvq %>%
   head(5)
 
-# Data frame dimensions
-dim(mvq)
+```
 
-# Summary 
+```{r render = knitr::normal_print}
+# Skim
 mvq %>%
-  # convert character variables and site_id to factor
-  mutate(across(c(where(is.character), site_id), factor)) %>%
-  summary()
+  mutate(site_id = as.character(site_id)) %>%
+  skim() 
 ```
 
 The qualitative data set offers a mix of 52 categorical and numerical variables describing site attributes and demographic/socioeconomic statistics of the surrounding area. Interestingly, site #23065 is missing from this data set and will have to be removed from the time series data set.
@@ -172,17 +171,18 @@ The qualitative data set offers a mix of 52 categorical and numerical variables 
 symdiff(mvts$site_id, mvq$site_id)
 ```
 
-`mvq` does not have any explicitly `NA` values, but does utilize a character string to indicate such. 
+`mvq` does not have any explicitly `NA` values, but does utilize character string to indicate such. 
 
-```{r}
+
+```{r render = knitr::normal_print}
 mvq %>%
-  # select columns containing "N/A"
-  select(where(~any(grepl("^N/?A$", .)))) %>%
-  # for each column, calculate proportion of observations containing "N/A"
+  # select columns containing "N/A" or "none"
+  select(where(~any(grepl("^N/?A$|^none$", ., ignore.case = TRUE)))) %>%
+  # for each column, calculate proportion of observations containing "N/A" or "none"
   summarise(
     across(
       everything(), 
-      ~sum(grepl("^N/?A$", .)) / n()
+      ~sum(grepl("^N/?A$|^none$", ., ignore.case = TRUE)) / n()
     )
   ) %>%
   # Covert to long-form
@@ -193,12 +193,12 @@ mvq %>%
 
 This can be solved with the following:
 
-```{r}
+```{r render = knitr::normal_print}
 mvq1 <- mvq %>%
   mutate(
     across(
-      where(~any(grepl("^N/?A$", .))),
-      ~replace(., grepl("^N/?A$", .), NA)
+      where(~any(grepl("^N/?A$|^none$", ., ignore.case = TRUE))),
+      ~replace(., grepl("^N/?A$|^none$", ., ignore.case = TRUE), NA)
     )
   )
 
@@ -241,10 +241,151 @@ mvq1 %>%
                names_to = c("col", ".value"),
                names_pattern = "(.*)_(.*)") %>%
   arrange(ndistinct)
+
+
+```
+
+It also appears some of the pump data is contradictory.
+
+```{r}
+sk_list <- list(
+  c(
+    "hi_flow_lanes",
+    "hi_flow_lanes_layout"
+  ),
+  c(
+    "hi_flow_lanes_layout",
+    "rv_lanes"
+  ),
+  c(
+    "rv_lanes",
+    "rv_lanes_layout"
+  ),
+  c(
+    "rv_lanes_layout",
+    "hi_flow_rv_lanes"
+  ),
+  c(
+    "hi_flow_rv_lanes",
+    "hi_flow_rv_lanes_layout"
+  ),
+  c(
+    "hi_flow_rv_lanes_layout",
+    "rv_lanes_fueling_positions"
+  ),
+  c(
+    "rv_lanes_fueling_positions",
+    "hi_flow_lanes_fueling_positions"
+  )
+)
+
+sk <- lapply(sk_list,
+       \(x){
+         mvq %>%
+           select(contains("lanes")) %>%
+           mutate(across(everything(), as.character)) %>%
+           count(
+             pick(all_of(x))
+           ) %>%
+           mutate(id = row_number(),
+                  .before = 1) %>%
+           pivot_longer(-c(n, id)) %>%
+           unite("name",
+                 name:value,
+                 sep = "\n") %>%
+           group_by(id) %>%
+           mutate(name2 = name[2]) %>%
+           ungroup() %>%
+           filter(name != name2)
+       }) %>%
+  list_rbind
+
+all_nodes <- unique(c(as.character(sk$name), as.character(sk$name2)))
+
+sk1 <- sk %>%
+  mutate(from_id = match(name, all_nodes) - 1,
+         to_id = match(name2, all_nodes) - 1)
+
+plot_ly(
+  type = "sankey",
+  domain = list(
+    x = c(0,1),
+    y = c(0,1)
+  ),
+  orientation = "h",
+  #valueformat = ".0f",
+  node = list(
+    pad = 15,
+    thickness = 20,
+    line = list(
+      color = "black",
+      width = 0.5
+    ),
+    label = all_nodes
+  ),
+  link = list(
+    source = sk1$from_id,
+    target = sk1$to_id,
+    value = sk1$n
+  )
+) %>% 
+  layout(
+    title = "Sankey Diagram",
+    font = list(
+      size = 10
+    )
+  )
 ```
 
 
-## Dates
+```{r}
+# Applying all basic cleaning steps and assigning to original object name
+mvts <- read_csv("../data/time_series_data_msba.csv") %>%
+  # removing unnamed row index column
+  select(-1) %>% 
+  # simplifying column names
+  rename_with(~str_split_1(paste0("open_date,date,week_id,day_name,holiday,",
+                                  "day_type,inside_sales,food_service,diesel,",
+                                  "unleaded,site_id"), ",")) %>% 
+  # set site_id as first column
+  relocate(site_id) %>%
+  arrange(site_id, date) %>%
+  # removing store not found in `mvq`
+  filter(site_id != 23065)
+
+mvq <- read_csv("../data/qualitative_data_msba.csv") %>%
+  # removing unnamed row index column
+  # `RV Lanes Fueling Positions` and `Hi-Flow Lanes Fueling Positions` are duplicated columns
+  select(-c(1, `RV Lanes Fueling Positions`, `Hi-Flow Lanes Fueling Positions`)) %>%
+  # set site_id as first column
+  select(site_id = site_id_msba, colnames(.)) %>% 
+  # simplify column names
+  rename_with(\(x){
+    # replace spaces, slashes, and hyphens with underscores
+    gsub(" +|-|/", "_", tolower(x)) %>%
+      # remove single quotes and apostrophes
+      gsub("'|’", "", .) %>%
+      # validate variables beginning with numbers
+      gsub("^(\\d)", "x\\1", .)
+  }) %>%
+  # distinguish from variable found in time series data
+  rename(has_diesel = diesel) %>%
+  # creating explicit NA's
+  mutate(
+    across(
+      where(~any(grepl("^N/?A$|^none$", ., ignore.case = TRUE))),
+      ~replace(., grepl("^N/?A$|^none$", ., ignore.case = TRUE), NA)
+    )
+  ) %>%
+  # removing zero-variance variables
+  select(-c(c(front_door_count, godfathers_pizza, has_diesel,
+  car_wash, ev_charging, rv_lanes_stack_type,
+  hi_flow_lanes_stack_type, hi_flow_rv_lanes_stack_type,
+  non_24_hour, self_check_out)))
+```
+
+
+# Dates
 
 The entire data set spans from 2021-01-12 to 2023-08-16 and all 38 stores are present for one year and one day. Is the extra day of any analytical significance or simply an artifact of the fiscal calendar? Given that every store exists for the same length of time, it will be helpful to know the distribution of stores across dates.
 
@@ -277,7 +418,7 @@ The entire data set spans from 2021-01-12 to 2023-08-16 and all 38 stores are pr
   scale_y_continuous(breaks = seq(0, 30, 5)) +
   theme_minimal(20) +
   labs(title = "Count of stores vs date")
-} /
+} / # vertically combining plots with `patchwork` package
   # Line plot
   {
     mvts %>%
@@ -295,13 +436,13 @@ The entire data set spans from 2021-01-12 to 2023-08-16 and all 38 stores are pr
       theme_minimal(20) +
       labs(title = "Store-wise date range",
            y = "Cumulative store count")
-  }`
+  }
 
 ```
 
 Given that `open_date` is not uniformly distributed, network-wide seasonality will have to be calculated either on a sales per store basis or by standardizing the date by attributing a day ID similar to `week_id`. Maverik expressed the importance of aligning days in a standardized manner, which is why `week_id` is included. I'll begin dissecting the fiscal calendar structure by determining if a singular day of the week begins each week.
 
-```{r}
+```{r render = knitr::normal_print}
 mvts %>%
   distinct(date, .keep_all = TRUE) %>%
   # since week_id resets each year, values are not unique to distinct weeks
@@ -352,6 +493,11 @@ day_id_df %>%
 
 ```
 
+# Explanatory variables
+
+```{r}
+mvq
+```
 
 
 # Target variables
@@ -364,11 +510,16 @@ mvts %>%
                values_to = "sales") %>%
   group_by(metric, site_id) %>%
   summarise(sales = sum(sales)) %>%
-  mutate(sales = scale(sales)[,1]) %>%
+  mutate(avg = mean(sales),
+         med = median(sales)) %>%
   ggplot() +
-  geom_density(aes(sales, color = metric)) +
+  geom_density(aes(sales, color = metric),
+               linewidth = 1) +
+  #coord_cartesian(xlim = c(0, 2e6)) +
   theme_minimal(20) +
-  labs(title = "Distribution of key sales metrics (scaled and centered)")
+  theme(legend.position = "top",
+        legend.title = element_blank()) +
+  labs(title = "Distribution of key sales metrics")
 
 # Violin
 mvts %>%
@@ -377,44 +528,210 @@ mvts %>%
                values_to = "sales") %>%
   group_by(metric, site_id) %>%
   summarise(sales = sum(sales)) %>%
-  mutate(sales = scale(sales)[,1]) %>%
+  #mutate(sales = scale(sales)[,1]) %>%
   ggplot() +
   geom_violin(aes(metric, sales, fill = metric),
-              color = "white", draw_quantiles = c(0.25, 0.5, 0.75)) +
+              color = "white", draw_quantiles = c(0.25, 0.5, 0.75),
+              scale = "area") +
   theme_minimal(20) +
   labs(title = "Distribution of key sales metrics (scaled and centered)")
 
 # Line
 mvts %>%
+  # add `day_id`
   left_join(day_id_df %>%
               select(date, day_id), "date") %>%
+  # place all sales into one column, labeled by another
   pivot_longer(c(inside_sales, food_service, diesel, unleaded),
                names_to = "metric",
                values_to = "sales") %>%
+  # aggregate by `day_id` and sales metric
   group_by(metric, day_id) %>%
-  summarise(sales = sum(sales)) %>%
-  mutate(sales = scale(sales)[,1]) %>%
+  summarise(sales = sum(sales),
+            day_type = day_type[1]) %>%
   ggplot() +
-  geom_line(aes(day_id, sales)) +
-  facet_rep_wrap(~metric, repeat.tick.labels = TRUE, ncol = 1)
+  # `group = 1` prevents a separate line for each `day_type`
+  geom_line(aes(day_id, sales, color = day_type, group = 1)) +
+  # create separate plot for each `metric`
+  facet_rep_wrap(~metric, repeat.tick.labels = TRUE, scales = "free", ncol = 1) +
+  theme_minimal(20) +
+  theme(legend.position = "top",
+        legend.title = element_blank())
+
+# Line with holiday 
+
+# Categorical line color
+mvts %>%
+  # add `day_id`
+  left_join(day_id_df %>%
+              select(date, day_id), "date") %>%
+  group_by(day_id) %>%
+  mutate(is_holiday = case_when(holiday != "NONE" ~ "holiday",
+                                .default = "regular day")) %>%
+  # place all sales into one column, labeled by another
+  pivot_longer(c(inside_sales, food_service, diesel, unleaded),
+               names_to = "metric",
+               values_to = "sales") %>%
+  # aggregate by `day_id` and sales metric
+  group_by(metric, day_id) %>%
+  summarise(sales = sum(sales),
+            is_holiday = is_holiday[1]) %>% 
+  ggplot() +
+  # `group = 1` prevents a separate line for each `is_holiday`
+  geom_line(aes(day_id, sales, color = is_holiday, group = 1),
+            linewidth = 1) +
+  # Create generalized date labels
+  scale_x_continuous(breaks = c(1, cumsum(days_in_month(as_date(paste0("2021-", month.abb, "-01")))) + 1),
+                     labels = ~format(as_date("2021-12-31") + ., "%b %d")) +
+  # Rescale labels to thousands
+  scale_y_continuous(labels = ~./1e3) +
+  # create separate plot for each `metric`
+  facet_rep_wrap(~metric, repeat.tick.labels = TRUE, scales = "free", ncol = 1) +
+  theme_minimal(20) +
+  theme(legend.position = "top",
+        legend.title = element_blank()) +
+  labs(title = "Annualized store sales",
+       x = "generalized date",
+       y = "sales $ (thousands)")
+
+# Create df for plot to shade holidays
+holiday_4gg <- mvts %>%
+  # add `day_id`
+  left_join(day_id_df %>%
+              select(date, day_id), "date") %>%
+  # place all sales into one column, labeled by another
+  pivot_longer(c(inside_sales, food_service, diesel, unleaded),
+               names_to = "metric",
+               values_to = "sales") %>%
+  # aggregate by `day_id` and sales metric
+  group_by(metric, day_id) %>%
+  mutate(sales = sum(sales)) %>%
+  # aggregate by `metric`
+  group_by(metric) %>%
+  mutate(sales_max = max(sales),
+         sales_min = min(sales)) %>%
+  # Keep only holidays
+  filter(holiday != "NONE") %>%
+  group_by(holiday, metric) %>%
+  # get min/max of `day_id` and `sales`
+  reframe(day_id = range(day_id),
+          sales = c(sales_min[1], sales_max[1]))
+
+mvts %>%
+  # add `day_id`
+  left_join(day_id_df %>%
+              select(date, day_id), "date") %>%
+  # place all sales into one column, labeled by another
+  pivot_longer(c(inside_sales, food_service, diesel, unleaded),
+               names_to = "metric",
+               values_to = "sales") %>%
+  # aggregate by `day_id` and sales metric
+  group_by(metric, day_id) %>%
+  summarise(sales = sum(sales),
+            day_type = day_type[1]) %>%
+  ggplot() +
+  geom_mark_rect(data = holiday_4gg,
+                 aes(day_id, sales, 
+                     group = interaction(holiday, metric)),
+                 expand = unit(1.5, "mm"), radius = unit(0.5, "mm"), 
+                 fill = "#000000", alpha = 0.1, color = NA) +
+  # `group = 1` prevents a separate line for each `day_type`
+  geom_line(aes(day_id, sales, color = day_type, group = 1)) +
+  # Rescale labels to thousands
+  scale_y_continuous(labels = ~./1e3) +
+  # create separate plot for each `metric`
+  facet_rep_wrap(~metric, repeat.tick.labels = TRUE, scales = "free", ncol = 1) +
+  theme_minimal(20) +
+  theme(legend.position = "top",
+        legend.title = element_blank()) +
+  labs(title = "Sales vs day_id",
+       subtitle = "Shaded regions indicate holidays",
+       y = "sales $ (thousands)")
 
 # Correlation
 mvts %>%
   left_join(day_id_df %>%
               select(date, day_id), "date") %>%
-  select(inside_sales, food_service, diesel, unleaded, day_id) %>%
-  ggpairs(aes(color = cut(day_id, 91, keeplow)))
+  select(inside_sales, food_service, diesel, unleaded) %>%
+  ggpairs() +
+  labs(title = "Generalized pairs of daily store sales")
+
+mvts %>%
+  left_join(day_id_df %>%
+              select(date, day_id), "date") %>%
+  group_by(site_id) %>%
+  summarise(across(c(inside_sales, food_service, diesel, unleaded), sum)) %>%
+  ggpairs() +
+  labs(title = "Generalized pairs of annualized store sales")
   
+```
+
+Based on the time series line plot, it's clear that there is weekly and yearly seasonality but weekly seasonality is more pronounced with weekdays seeing greater sales than weekends. We also see that certain holidays affect sales more than others. This is not surprising but this will certainly have to be accounted for during modeling.
+
+All of the sales metrics besides `diesel` are fairly normally distributed but still right-skewed. Intuitively, `inside_sales` and `food_service` are very positively correlated. The relationship of the other pairs are rather heteroskedastic or otherwise inconsistent. Determining which (if any) features in the available data can explain this irregular variance will be valuable when forecasting.   
+
+The scatter plot from the generalized pairs plot reveals that some locations had no sales on at least one day. One may think that these might be stores not open 24 hours a day, but we discovered earlier that only one value for `non-24_hour` exists in the data and subsequently all stores are open 24 hours a day. 
+
+```{r}
+mvts %>%
+  group_by(site_id) %>%
+  filter(if_any(c(inside_sales, food_service, diesel, unleaded), ~any(.<=0))) %>%
+  summarise(across(c(inside_sales, food_service, diesel, unleaded),
+                   list(avg = ~mean(.),
+                        med = ~median(.),
+                        sd = ~sd(.),
+                        max = ~max(.),
+                        min = ~min(.),
+                        dec1 = ~quantile(., 0.1),
+                        daysNoSales = ~sum(. == 0)))) %>%
+  pivot_longer(-site_id,
+               names_to = c("metric", ".value"),
+               names_pattern = "(.*)_(.*)")
+```
+
+We can determine that only two stores account for the zero sales values. Based on each stores' summary statistics, the absence of sales for even a single day seems peculiar. This could be indicative of some disruption to the facilities that is not indicated in the data. It can be inferred that other stores could have possibly also experienced similar, but not complete, disruptions that would affect their sales that we cannot account for. Unfortunately, not much can be done about this and hopefully the scale of such instances are minor.
+
+Conversely, there seems to be at least one store that has dramatically higher sales than the rest which begs the question of what to do with sufficiently outlying data. Before deciding to remove such cases, it will be important to see if the other corresponding data can suggest an explanatory pattern which is valuable for prediction.
+
+```{r}
+mvts %>%
+  # distinguish unusual diesel seller
+  mutate(big_seller = site_id == 21980,
+         alpha = ifelse(big_seller, 1, 0.4)) %>%
+  arrange(big_seller) %>%
+  ggplot() +
+  geom_point(aes(inside_sales, diesel, color = big_seller, alpha = alpha)) +
+  # dynamic opacity
+  scale_alpha_identity() +
+  theme_minimal(20) +
+  theme(legend.position = "top",
+        legend.title = element_blank()) +
+  labs(title = "Diesel vs Inside Sales, spotlight on Site 21980")
 ```
 
 
 
+## Relationship with features
 
+```{r}
+# Numerical features
+corr_df <- mvts %>%
+  group_by(site_id) %>%
+  summarise(across(inside_sales:unleaded, sum)) %>%
+  left_join(mvq, "site_id") %>%
+  select(where(is.numeric), -c(site_id, open_year, years_since_last_project))
 
-
-
-
-
+corr_df %>%
+  cor() %>%
+  ggcorrplot::ggcorrplot(#method = "circle",
+                         type = "lower",
+                         p.mat = ggcorrplot::cor_pmat(corr_df),
+                         lab = TRUE,
+                         lab_size = 3,
+                         outline.color = "white",
+                         hc.order = TRUE,
+                         insig = "blank")
+```
 
 
 
