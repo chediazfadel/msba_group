@@ -12,7 +12,7 @@ output:
     fig_width: 15
     fig_height: 10
 editor_options: 
-  chunk_output_type: console
+  chunk_output_type: inline
 ---
 <style type="text/css">
 .main-container {
@@ -171,7 +171,7 @@ The qualitative data set offers a mix of 52 categorical and numerical variables 
 symdiff(mvts$site_id, mvq$site_id)
 ```
 
-`mvq` does not have any explicitly `NA` values, but does utilize character string to indicate such. 
+`mvq` does not have any explicitly `NA` values, but does utilize character string to indicate such. Maverik has indicated that "N/A", "None", or any analogous value indicates the absence of that attribute at the store rather than missing data. In this case, it would be best to apply a single value for these cases instead of using explicit `NA` and removing.
 
 
 ```{r render = knitr::normal_print}
@@ -191,26 +191,26 @@ mvq %>%
                values_to = "prop_na")
 ```
 
-This can be solved with the following:
+This can be achieved with the following:
 
 ```{r render = knitr::normal_print}
 mvq1 <- mvq %>%
   mutate(
     across(
-      where(~any(grepl("^N/?A$|^none$", ., ignore.case = TRUE))),
-      ~replace(., grepl("^N/?A$|^none$", ., ignore.case = TRUE), NA)
+      where(~any(grepl("^N/?A$", ., ignore.case = TRUE))),
+      ~replace(., grepl("^N/?A$", ., ignore.case = TRUE), "None")
     )
   )
 
 # Confirm same proportions as before
 mvq1 %>% 
   # select columns containing missing values
-  select(where(~any(is.na(.)))) %>%
+  select(where(~any(. == "None"))) %>%
   # for each column, calculate proportion of missing values
   summarise(
     across(
       everything(),
-    ~sum(is.na(.)) / n()
+    ~sum(. == "None") / n()
     )
   ) %>%
   #convert to long-form
@@ -245,9 +245,17 @@ mvq1 %>%
 
 ```
 
-It also appears some of the pump data is contradictory.
+It also appears some of the fuel lane data is contradictory and/or redundant. Site 22015 has no high-flow RV lanes as indicated by `hi_flow_rv_lanes` but somehow their high-flow RV lane layout is "In-Line". While a single observation can easily be handled, this instance further brings into question the pervasiveness of such errors, detectable or otherwise.
+
 
 ```{r}
+# Show seemingly contradictory combination
+mvq1 %>%
+  filter(hi_flow_rv_lanes == "No",
+         hi_flow_rv_lanes_layout == "In-Line") %>%
+  select(site_id, hi_flow_rv_lanes, hi_flow_rv_lanes_layout)
+
+# Create list of desired lane variable combinations
 sk_list <- list(
   c(
     "hi_flow_lanes",
@@ -279,62 +287,91 @@ sk_list <- list(
   )
 )
 
+# Take each value of list and perform transformations within a data frame
 sk <- lapply(sk_list,
-       \(x){
-         mvq %>%
-           select(contains("lanes")) %>%
-           mutate(across(everything(), as.character)) %>%
-           count(
-             pick(all_of(x))
-           ) %>%
-           mutate(id = row_number(),
-                  .before = 1) %>%
-           pivot_longer(-c(n, id)) %>%
-           unite("name",
-                 name:value,
-                 sep = "\n") %>%
-           group_by(id) %>%
-           mutate(name2 = name[2]) %>%
-           ungroup() %>%
-           filter(name != name2)
-       }) %>%
-  list_rbind
+             \(x){
+               mvq1 %>%
+                 # ensure compatibility across variables when changing to long form
+                 mutate(across(everything(), as.character)) %>%
+                 # count instances of value combinations
+                 count(
+                   pick(all_of(x))
+                 ) %>%
+                 # create row ids
+                 mutate(id = row_number(),
+                        .before = 1) %>%
+                 # convert to long form
+                 pivot_longer(-c(n, id)) %>%
+                 # combine variable name and variable value into single column
+                 unite("name",
+                       name:value,
+                       sep = ":\n") %>%
+                 group_by(id) %>%
+                 # place corresponding pair into different column
+                 mutate(name2 = name[2]) %>%
+                 ungroup() %>%
+                 # remove duplicates
+                 filter(name != name2)
+             }) %>%
+  # combine list output into singe data frame
+  list_rbind() %>%
+  # create required positional ids for sankey plot
+  mutate(from_id = match(name, unique(c(name, name2))) - 1,
+         to_id = match(name2, unique(c(name, name2))) - 1)
 
-all_nodes <- unique(c(as.character(sk$name), as.character(sk$name2)))
-
-sk1 <- sk %>%
-  mutate(from_id = match(name, all_nodes) - 1,
-         to_id = match(name2, all_nodes) - 1)
-
+# create sankey plot
 plot_ly(
   type = "sankey",
+  # ensure plot covers entire space
   domain = list(
     x = c(0,1),
     y = c(0,1)
   ),
   orientation = "h",
-  #valueformat = ".0f",
   node = list(
+    # set spacing between nodes
     pad = 15,
     thickness = 20,
     line = list(
       color = "black",
       width = 0.5
     ),
-    label = all_nodes
+    label = unique(c(sk$name, sk$name2))
   ),
+  # Define paths
   link = list(
-    source = sk1$from_id,
-    target = sk1$to_id,
-    value = sk1$n
+    source = sk$from_id,
+    target = sk$to_id,
+    value = sk$n,
+    # color concerning combinations
+    color = c(rep("#bbbbbbaa", 13), "#ff8888", rep("#bbbbbbaa", 16))
   )
 ) %>% 
   layout(
-    title = "Sankey Diagram",
+    title = "Distribution of fuel lane descriptions",
     font = list(
       size = 10
     )
   )
+
+```
+
+Furthermore, there are only two unique combinations between `rv_lanes_stack_type` and `hi_flow_rv_lanes_stack_type`: either both "None" or both "HF/RV". It seems extremely likely to me that "HF/RV" stands for "Hi(gh) Flow / Recreational Vehicle". If that is true and it is also true that "N/A" and "None" mean the absence of the attribute (and not the absence of the data), then it is necessarily true that
+
+If all of the following are true:
+
+-   "HF/RV" stands for "Hi(gh) Flow / Recreational Vehicle"\
+-   "N/A" and "None" mean the absence of the attribute and not the absence of the data\
+-   The absence of any "layout" or "stack type" is equivalent to the absence of the lanes/pumps entirely\
+
+then it is necessarily true that all RV lanes in this data set are hi-flow. Site 22015 is the only observation which violates this condition. With so few sites to begin with, I'm hesitant to remove site 22015 from the data and instead would prefer to manually correct the data. A final decision will be made before modeling. In any case, the lane/pump data can be simplified to remove redundant data. This will also occur at a later time before modeling.
+
+```{r}
+mvq1 %>%
+  count(rv_lanes,
+        hi_flow_lanes,
+        rv_lanes_stack_type,
+        hi_flow_rv_lanes_stack_type)
 ```
 
 
@@ -373,15 +410,13 @@ mvq <- read_csv("../data/qualitative_data_msba.csv") %>%
   # creating explicit NA's
   mutate(
     across(
-      where(~any(grepl("^N/?A$|^none$", ., ignore.case = TRUE))),
-      ~replace(., grepl("^N/?A$|^none$", ., ignore.case = TRUE), NA)
+      where(~any(grepl("^N/?A$", ., ignore.case = TRUE))),
+      ~replace(., grepl("^N/?A$", ., ignore.case = TRUE), "None")
     )
   ) %>%
   # removing zero-variance variables
   select(-c(c(front_door_count, godfathers_pizza, has_diesel,
-  car_wash, ev_charging, rv_lanes_stack_type,
-  hi_flow_lanes_stack_type, hi_flow_rv_lanes_stack_type,
-  non_24_hour, self_check_out)))
+  car_wash, ev_charging, non_24_hour, self_check_out)))
 ```
 
 
@@ -493,11 +528,6 @@ day_id_df %>%
 
 ```
 
-# Explanatory variables
-
-```{r}
-mvq
-```
 
 
 # Target variables
@@ -723,16 +753,161 @@ corr_df <- mvts %>%
 
 corr_df %>%
   cor() %>%
-  ggcorrplot::ggcorrplot(#method = "circle",
-                         type = "lower",
-                         p.mat = ggcorrplot::cor_pmat(corr_df),
-                         lab = TRUE,
-                         lab_size = 3,
-                         outline.color = "white",
-                         hc.order = TRUE,
-                         insig = "blank")
+  ggcorrplot::ggcorrplot(method = "circle",
+    p.mat = ggcorrplot::cor_pmat(corr_df),
+    lab = TRUE,
+    lab_size = 3,
+    outline.color = "white",
+    hc.order = TRUE,
+    insig = "blank")
+
+# Sina plot, diesel vs women's sink, store+date level
+mvts %>%
+  left_join(mvq, "site_id") %>%
+  pivot_longer(inside_sales:unleaded,
+               names_to = "metric",
+               values_to = "sales") %>%
+  group_by(womens_sink_count, metric) %>%
+  mutate(med = median(sales)) %>%
+  ggplot() +
+  geom_sina(aes(womens_sink_count, sales, 
+                color = after_stat(scaled),
+                group = womens_sink_count),
+            size = 1, scale = "width") +
+  geom_linerange(data = \(x) {x %>%
+      summarise_all(~.[1])},
+      aes(y = med, xmin = womens_sink_count - 0.25, xmax = womens_sink_count + 0.25),
+      linetype = "dashed", linewidth = 1) +
+  viridis::scale_color_viridis(guide = guide_colorbar(title.position = "top",
+                                                      title.hjust = 0.5)) +
+  scale_y_continuous(labels = ~./1000) +
+  facet_rep_wrap(~metric, repeat.tick.labels = TRUE, scales = "free") +
+  theme_minimal(20) +
+  theme(legend.direction = "horizontal",
+        legend.position = "top",
+        legend.key.width = unit(15, "mm")) +
+  labs(title = "Distribution of daily store sales sales\n given count of women's sinks",
+       y = "sales $ (thousands)",
+       color = "scaled density")
+
+mvts %>%
+  left_join(mvq, "site_id") %>%
+  mutate(total_pumps = traditional_forecourt_fueling_positions +
+           hi_flow_lanes_fueling_positions +
+           rv_lanes_fueling_positions) %>%
+  pivot_longer(c(contains("position"), total_pumps),
+               names_to = "pump_type",
+               values_to = "n_pumps") %>%
+  pivot_longer(inside_sales:unleaded,
+               names_to = "metric",
+               values_to = "sales") %>%
+  group_by(pump_type, n_pumps, metric) %>%
+  mutate(med = median(sales)) %>%
+  ggplot() +
+  geom_sina(aes(n_pumps, sales, 
+                color = after_stat(scaled),
+                group = n_pumps),
+            size = 1, scale = "width") +
+  geom_linerange(data = \(x) {x %>%
+      #group_by(categ) %>%
+      summarise_all(~.[1])},
+      aes(y = med, xmin = n_pumps - 0.4, xmax = n_pumps + 0.4),
+      linewidth = 0.5, color = "red") +
+  viridis::scale_color_viridis(guide = guide_colorbar(title.position = "top",
+                                                      title.hjust = 0.5)) +
+  scale_y_continuous(labels = ~./1000) +
+  facet_rep_grid(metric~pump_type, repeat.tick.labels = TRUE, scales = "free") +
+  theme_minimal(20) +
+  theme(legend.direction = "horizontal",
+        legend.position = "top",
+        legend.key.width = unit(15, "mm"),
+        plot.margin = unit(c(0,0,0,0), "lines")) +
+  labs(title = "Distribution of daily sales given count of fuel pumps",
+       y = "sales $ (thousands)",
+       color = "scaled density")
+
+
+
 ```
 
+### Linear models
+
+```{r}
+lapply(c("inside_sales", "food_service", "diesel", "unleaded"),
+       \(x){
+         
+         xdata <- mvts %>%
+           left_join(mvq, "site_id") %>%
+           mutate(across(where(is.numeric), ~scale(.)[,1])) %>%
+           group_by(site_id) %>%
+           mutate(across(inside_sales:unleaded,
+                         list(lag = ~lag(., default = last(.))))) %>%
+           ungroup() %>%
+           select(-c(where(is.Date), site_id, open_year, years_since_last_project)) 
+         
+         xlm <- lm(
+           paste(x, "~ ."),
+           data = xdata 
+         ) %>%
+           summary
+         
+         out <- xlm$coefficients %>%
+           as.data.frame(x = .) %>%
+           mutate(var = row.names(.),
+                  .before = 1) %>%
+           as_tibble() %>%
+           mutate(sig = case_when(`Pr(>|t|)` <= 0.001 ~ "***",
+                                  `Pr(>|t|)` <= 0.01 ~ "**",
+                                  `Pr(>|t|)` <= 0.05 ~ "*",
+                                  `Pr(>|t|)` <= 0.1 ~ "."),
+                  r2 = xlm$r.squared,
+                  target = x) %>%
+           relocate(target)
+       }) %>%
+  list_rbind() %>%
+  filter(!grepl("Intercept", var)) %>%
+  arrange(target, desc(nchar(sig)), sig, -abs(Estimate))
+
+
+# Simple LM (one predictor) on annualized sales
+lapply(c("inside_sales", "food_service", "diesel", "unleaded"),
+       \(x){
+         
+         xdata <- mvts %>%
+           group_by(site_id) %>%
+           summarise(across(inside_sales:unleaded, sum)) %>%
+           left_join(mvq, "site_id") %>%
+           mutate(across(where(is.numeric), ~scale(.)[,1])) %>%
+           ungroup() %>%
+           select(-c(where(is.Date), site_id, open_year, years_since_last_project))
+         
+         lapply(colnames(xdata),
+                \(y){
+                  xlm <- lm(
+                    paste(x, "~", y),
+                    data = xdata 
+                  ) %>%
+                    summary
+                  
+                  out <- xlm$coefficients %>%
+                    as.data.frame(x = .) %>%
+                    mutate(var = row.names(.),
+                           .before = 1) %>%
+                    as_tibble() %>%
+                    mutate(sig = case_when(`Pr(>|t|)` <= 0.001 ~ "***",
+                                           `Pr(>|t|)` <= 0.01 ~ "**",
+                                           `Pr(>|t|)` <= 0.05 ~ "*",
+                                           `Pr(>|t|)` <= 0.1 ~ "."),
+                           r2 = xlm$r.squared,
+                           target = x) %>%
+                    relocate(target)
+                }) %>% list_rbind()
+         
+       }) %>%
+  list_rbind() %>%
+  filter(!grepl("Intercept", var)) %>%
+  arrange(desc(nchar(sig)), sig, -abs(Estimate)) 
+```
 
 
 
