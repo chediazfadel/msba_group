@@ -8,11 +8,10 @@ output:
     toc: yes
     df_print: paged
     theme: darkly
-    highlight: tango
+    highlight: cobalt.theme
     fig_width: 15
     fig_height: 10
-editor_options: 
-  chunk_output_type: inline
+    css: styles.css
 ---
 <style type="text/css">
 .main-container {
@@ -248,7 +247,7 @@ mvq1 %>%
 It also appears some of the fuel lane data is contradictory and/or redundant. Site 22015 has no high-flow RV lanes as indicated by `hi_flow_rv_lanes` but somehow their high-flow RV lane layout is "In-Line". While a single observation can easily be handled, this instance further brings into question the pervasiveness of such errors, detectable or otherwise.
 
 
-```{r}
+```{r out.width='100%',out.height='150%'}
 # Show seemingly contradictory combination
 mvq1 %>%
   filter(hi_flow_rv_lanes == "No",
@@ -297,6 +296,8 @@ sk <- lapply(sk_list,
                  count(
                    pick(all_of(x))
                  ) %>%
+                 # shorten column names for cleaner output
+                 rename_with(~gsub("_lanes|_fueling", "", .)) %>%
                  # create row ids
                  mutate(id = row_number(),
                         .before = 1) %>%
@@ -356,7 +357,7 @@ plot_ly(
 
 ```
 
-Furthermore, there are only two unique combinations between `rv_lanes_stack_type` and `hi_flow_rv_lanes_stack_type`: either both "None" or both "HF/RV". It seems extremely likely to me that "HF/RV" stands for "Hi(gh) Flow / Recreational Vehicle". If that is true and it is also true that "N/A" and "None" mean the absence of the attribute (and not the absence of the data), then it is necessarily true that
+Furthermore, there are only two unique combinations of `rv_lanes_stack_type` and `hi_flow_rv_lanes_stack_type`: either both "None" or both "HF/RV". It seems extremely likely to me that "HF/RV" stands for "Hi(gh) Flow / Recreational Vehicle". 
 
 If all of the following are true:
 
@@ -533,6 +534,50 @@ day_id_df %>%
 # Target variables
 
 ```{r}
+mvts %>%
+  # Aggregate sales
+  summarise(across(inside_sales:unleaded, sum)) %>%
+  # Convert to long-form
+  pivot_longer(everything(),
+               names_to = "metric",
+               values_to = "sales") %>%
+  # get percentage of sales by sales metric
+  mutate(p = percent(sales/sum(sales), 0.1))
+
+mvts %>%
+  # aggregate sales by site
+  group_by(site_id) %>%
+  summarise(across(inside_sales:unleaded, sum)) %>%
+  # convert to long-form
+  pivot_longer(inside_sales:unleaded,
+               names_to = "metric",
+               values_to = "sales") %>%
+  # get percentage of sales by sales metric
+  group_by(site_id) %>%
+  mutate(p = sales/sum(sales),
+         # create separate variable to be used in `arrange`
+         d = p[metric == "diesel"]) %>%
+  arrange(-d) %>%
+  ungroup() %>%
+  # ensure stores are arranged by % diesel in plot
+  mutate(site_index = consecutive_id(site_id),
+         metric = fct_reorder(metric, p)) %>%
+  ggplot(aes(site_index, p)) +
+  geom_col(aes(fill = metric)) +
+  geom_text(aes(label = percent(p, 1), group = metric),
+            # place label in center of `group`
+            position = position_stack(vjust = 0.5)) +
+  theme_minimal(20) +
+  theme(legend.position = "top",
+        legend.title = element_blank()) +
+  labs(title = "Proportion of total store sales by sales metric",
+       x = "site index (descending diesel contribution)",
+       y = NULL)
+  
+```
+
+
+```{r}
 # Histogram (density)
 mvts %>%
   pivot_longer(c(inside_sales, food_service, diesel, unleaded),
@@ -558,13 +603,12 @@ mvts %>%
                values_to = "sales") %>%
   group_by(metric, site_id) %>%
   summarise(sales = sum(sales)) %>%
-  #mutate(sales = scale(sales)[,1]) %>%
   ggplot() +
   geom_violin(aes(metric, sales, fill = metric),
               color = "white", draw_quantiles = c(0.25, 0.5, 0.75),
               scale = "area") +
   theme_minimal(20) +
-  labs(title = "Distribution of key sales metrics (scaled and centered)")
+  labs(title = "Distribution of key sales metrics")
 
 # Line
 mvts %>%
@@ -684,7 +728,7 @@ mvts %>%
               select(date, day_id), "date") %>%
   select(inside_sales, food_service, diesel, unleaded) %>%
   ggpairs() +
-  labs(title = "Generalized pairs of daily store sales")
+  labs(title = "Correlation of daily store sales")
 
 mvts %>%
   left_join(day_id_df %>%
@@ -692,7 +736,7 @@ mvts %>%
   group_by(site_id) %>%
   summarise(across(c(inside_sales, food_service, diesel, unleaded), sum)) %>%
   ggpairs() +
-  labs(title = "Generalized pairs of annualized store sales")
+  labs(title = "Correlation of annualized store sales")
   
 ```
 
@@ -807,7 +851,7 @@ mvts %>%
   geom_sina(aes(n_pumps, sales, 
                 color = after_stat(scaled),
                 group = n_pumps),
-            size = 1, scale = "width") +
+            size = 0.5, scale = "width") +
   geom_linerange(data = \(x) {x %>%
       #group_by(categ) %>%
       summarise_all(~.[1])},
@@ -830,7 +874,7 @@ mvts %>%
 
 ```
 
-### Linear models
+### Linear regression
 
 ```{r}
 lapply(c("inside_sales", "food_service", "diesel", "unleaded"),
@@ -860,13 +904,16 @@ lapply(c("inside_sales", "food_service", "diesel", "unleaded"),
                                   `Pr(>|t|)` <= 0.01 ~ "**",
                                   `Pr(>|t|)` <= 0.05 ~ "*",
                                   `Pr(>|t|)` <= 0.1 ~ "."),
+                           `Pr(>|t|)` = round(`Pr(>|t|)`, 5),
                   r2 = xlm$r.squared,
                   target = x) %>%
            relocate(target)
        }) %>%
   list_rbind() %>%
-  filter(!grepl("Intercept", var)) %>%
-  arrange(target, desc(nchar(sig)), sig, -abs(Estimate))
+  filter(!grepl("Intercept", var),
+         grepl("\\*", sig)) %>%
+  group_by(target) %>%
+  slice_max(Estimate, n = 5)
 
 
 # Simple LM (one predictor) on annualized sales
@@ -898,6 +945,7 @@ lapply(c("inside_sales", "food_service", "diesel", "unleaded"),
                                            `Pr(>|t|)` <= 0.01 ~ "**",
                                            `Pr(>|t|)` <= 0.05 ~ "*",
                                            `Pr(>|t|)` <= 0.1 ~ "."),
+                           `Pr(>|t|)` = round(`Pr(>|t|)`, 5),
                            r2 = xlm$r.squared,
                            target = x) %>%
                     relocate(target)
@@ -905,9 +953,13 @@ lapply(c("inside_sales", "food_service", "diesel", "unleaded"),
          
        }) %>%
   list_rbind() %>%
-  filter(!grepl("Intercept", var)) %>%
-  arrange(desc(nchar(sig)), sig, -abs(Estimate)) 
+  filter(!grepl("Intercept", var),
+         grepl("\\*", sig)) %>%
+  group_by(target) %>%
+  slice_max(r2, n = 5)
 ```
+
+## Time series decomposition
 
 
 
